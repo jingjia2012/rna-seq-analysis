@@ -1,0 +1,212 @@
+getwd()
+library(readr)
+library(data.table)
+# read_tsv 会自动识别压缩包，不需要写 gzfile
+rna_df <- read.delim(
+  "E:/RESEARCH/meniscus/rnaseq/counts_allsamples.txt.gz",
+  fileEncoding = "UTF-16LE", # 若报错可更换为 "UTF-16"
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE
+)
+
+
+# 如果你强烈需要 row.names（因为后续分析包如 DESeq2/EdgeR 需要）
+rna <- as.data.frame(rna_df)
+rownames(rna) <- rna$id
+rna$id <- NULL
+install.packages("EnhancedVolcano")
+library(BiocManager)
+BiocManager::install("EnhancedVolcano")
+library(DESeq2)
+library(pheatmap)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(org.Mm.eg.db) # 假设你的数据是小鼠（Nf2 基因常见于小鼠/人类模型，这里以小鼠为例，若为人类请换成 org.Hs.eg.db）
+library(ggplot2)
+library(dplyr)
+
+# 假设你的 rna 矩阵已经成功读入，且 row.names 是 gene_id
+# 1. 提取 count 列用于差异分析
+counts <- rna[, c("OE1", "OE2", "OE3",
+                  "WT1", "WT2", "WT3")]
+
+# 清洗列名，方便后续作图好看
+colnames(counts) <- c("OE1", "OE2", "OE3",
+                      "WT1", "WT2", "WT3")
+
+# 2. 构建分组信息
+sample_info <- data.frame(
+  row.names = colnames(counts),
+  group = factor(c("OE1", "OE2", "OE3",
+                   "WT1", "WT2", "WT3"), levels = c("OE", "WT"))
+)
+# 过滤低表达基因（至少在3个样本中 count > 10）
+keep <- rowSums(counts > 10) >= 3
+counts_filtered <- counts[keep, ]
+
+# 1. 从行名中去除数字，提取组别（例如 KO1 -> KO, WT1 -> WT）
+sample_info$group <- gsub("[0-9]", "", rownames(sample_info))
+
+# 2. 将 group 转化为因子，并指定对照组 WT 为 Baseline
+sample_info$group <- factor(sample_info$group, levels = c("WT", "OE"))
+
+# 3. 检查赋值后的 sample_info，确认 group 列没有 NA
+print(sample_info)
+
+# 4. 再次确保 counts 矩阵列名与 sample_info 行名完全一致
+counts_filtered <- counts_filtered[, rownames(sample_info)]
+
+# 5. 重新构建 DESeqDataSet 对象
+dds_norm <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData   = sample_info,
+  design    = ~ group
+)
+
+
+
+
+
+
+
+sample_info[is.na(sample_info$group), ]
+rownames(sample_info)[is.na(sample_info$group)]
+# VST 转换
+dds_norm <- DESeqDataSetFromMatrix(countData = counts_filtered, colData = sample_info, design = ~ group)
+vsd <- vst(dds_norm, blind = FALSE)
+vst_mat <- assay(vsd)
+
+# 计算样本间相关性系数矩阵
+cor_matrix <- cor(vst_mat, method = "pearson")
+
+# 绘制热图
+pheatmap(cor_matrix,
+         annotation_col = sample_info,
+         display_numbers = TRUE,  # 在格子里显示具体相关性数值
+         main = "Sample Correlation Heatmap",
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(50))
+# 1. 运行 DESeq2
+dds <- DESeqDataSetFromMatrix(countData = counts_filtered, colData = sample_info, design = ~ group)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("group", "OE", "WT"))
+res_df <- as.data.frame(res)
+
+# 2. 【关键步骤】从原始的 rna 矩阵中，根据行名(ID) 把对应的 gene_name 找回来
+# 假设你的 rna 矩阵行名是基因 ID，且包含 gene_name 列
+res_df$gene_id <- rownames(res_df)
+res_df$gene_name <- rna[rownames(res_df), "gene_name"]
+
+# 3. 筛选显著高/低表达的 Top 20 基因（此时用 gene_name 来排序和筛选）
+up_genes <- res_df %>% 
+  filter(pvalue < 0.05 & log2FoldChange > 1) %>% 
+  arrange(desc(log2FoldChange)) %>% 
+  head(20)
+
+down_genes <- res_df %>% 
+  filter(pvalue < 0.05 & log2FoldChange < -1) %>% 
+  arrange(log2FoldChange) %>% 
+  head(20)
+
+# 提取这 40 个基因的“基因名”用于标注
+select_labels <- c(up_genes$gene_name, down_genes$gene_name)
+
+#4. 【新增步骤】自定义颜色
+# 创建一个颜色向量，默认为灰色
+keyvals.color <- rep('grey', nrow(res_df))
+names(keyvals.color) <- rep('Not Significant', nrow(res_df))
+
+# 筛选高表达基因（pvalue < 0.05 & log2FoldChange > 1）设为红色
+keyvals.color[res_df$pvalue < 0.05 & res_df$log2FoldChange > 1] <- 'red'
+names(keyvals.color)[res_df$pvalue < 0.05 & res_df$log2FoldChange > 1] <- 'Up-regulated'
+
+# 筛选低表达基因（pvalue < 0.05 & log2FoldChange < -1）设为蓝色
+keyvals.color[res_df$pvalue < 0.05 & res_df$log2FoldChange < -1] <- 'blue'
+names(keyvals.color)[res_df$pvalue < 0.05 & res_df$log2FoldChange < -1] <- 'Down-regulated'
+
+# 5. 绘制火山图（使用自定义颜色）
+EnhancedVolcano(res_df,
+                lab = rownames(res_df),       # 显示基因名
+                x = 'log2FoldChange',
+                y = 'pvalue',  
+                selectLab = select_labels,    # 仅标注这40个基因名
+                pCutoff = 0.05,
+                FCcutoff = 1,
+                colCustom = keyvals.color,    # 【修改这里】使用自定义颜色
+                pointSize = 2.0,
+                labSize = 4.0,
+                title = 'OE vs WT Differential Expression',
+                subtitle = 'Top 20 Up- and Down-regulated genes labeled',
+                legendPosition = 'right')
+
+library(clusterProfiler)
+library(org.Mm.eg.db) # 记得如果是人类换成 org.Hs.eg.db
+library(ggplot2)
+library(patchwork)   # 用于拼图
+library(dplyr)
+
+
+
+# ==============================================================================
+# 1. 严格筛选上调(Up)和下调(Down)基因
+# ==============================================================================
+# 上调基因 (cKO 高表达): pvalue < 0.05 且 log2FC > 1
+up_deg <- res_df %>% filter(pvalue < 0.05 & log2FoldChange > 1) %>% pull(gene_id)
+
+# 下调基因 (cKO 低表达): pvalue < 0.05 且 log2FC < -1
+down_deg <- res_df %>% filter(pvalue < 0.05 & log2FoldChange < -1) %>% pull(gene_id)
+
+
+# ==============================================================================
+# 2. 基因 ID 转换 (转为 Entrez ID)
+# ==============================================================================
+# 转换上调基因 (假设你的从 type 是 SYMBOL，如果报错请参考前面的步骤修改)
+up_ids <- bitr(up_deg, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+
+# 转换下调基因
+down_ids <- bitr(down_deg, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Mm.eg.db)
+
+
+# ==============================================================================
+# 3. 分别进行 GO 富集分析 (以 BP 流程为例)
+# ==============================================================================
+# 上调基因 GO
+go_up <- enrichGO(gene          = up_ids$ENTREZID,
+                  OrgDb         = org.Mm.eg.db,
+                  keyType       = "ENTREZID",
+                  ont           = "ALL",
+                  pAdjustMethod = "BH",
+                  pvalueCutoff  = 0.05,
+                  readable      = TRUE)
+
+# 下调基因 GO
+go_down <- enrichGO(gene        = down_ids$ENTREZID,
+                    OrgDb       = org.Mm.eg.db,
+                    keyType     = "ENTREZID",
+                    ont         = "ALL",
+                    pAdjustMethod = "BH",
+                    pvalueCutoff= 0.05,
+                    readable    = TRUE)
+
+
+# ==============================================================================
+# 4. 分别绘制柱状图并自定义颜色 (高表达用红色系，低表达用蓝色系)
+# ==============================================================================
+# 4.1 高表达基因富集图 (设定低 p.adjust 值为深红色)
+p_up <- barplot(go_up, showCategory = 15, x = "Count") +
+  scale_fill_gradient(low = "firebrick", high = "mistyrose") + 
+  labs(title = "GO of Up-regulated Genes (cKO High)", x = "Gene Count") +
+  theme_minimal()
+
+# 4.2 低表达基因富集图 (设定低 p.adjust 值为深蓝色)
+p_down <- barplot(go_down, showCategory = 15, x = "Count") +
+  scale_fill_gradient(low = "dodgerblue4", high = "aliceblue") + 
+  labs(title = "GO of Down-regulated Genes (cKO Low)", x = "Gene Count") +
+  theme_minimal()
+
+
+# ==============================================================================
+# 5. 拼图输出
+# ==============================================================================
+# 左右并排拼接展示
+p_up + p_down
