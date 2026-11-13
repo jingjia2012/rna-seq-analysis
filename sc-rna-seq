@@ -1,0 +1,792 @@
+library(Seurat)
+library(cowplot)
+library("ggplot2")
+library("dplyr")
+library("patchwork")
+library("tidyverse")
+install.packages("hdf5r")
+library("hdf5r")
+BiocManager::install("DropletUtils")
+library("DropletUtils")
+setwd("E:\\RESEARCH\\meniscus\\GSE286034_RAW\\result")
+#导入数据，注意修改斜杠
+
+aged<- "E:\\RESEARCH\\meniscus\\GSE286034_RAW\\AM"
+young<- "E:\\RESEARCH\\meniscus\\GSE286034_RAW\\YM"
+
+
+#seurat读取数据
+aged <- Read10X(data.dir = aged)
+young <- Read10X(data.dir = young)
+
+
+
+# 创建各自的Seurat对象
+aged <- CreateSeuratObject(counts = aged, project = "aged")
+young <- CreateSeuratObject(counts = young, project = "young")
+
+
+
+# Set up control object
+
+aged$stim <- "aged"
+aged[["percent.mt"]] <- PercentageFeatureSet(aged, pattern = "^MT-")
+aged <- subset(aged, subset = nFeature_RNA > 200 & nFeature_RNA < 5000 & percent.mt < 5)
+aged <- NormalizeData(aged, verbose = FALSE)
+
+# Set up stimulated object
+
+young$stim <- "young"
+young[["percent.mt"]] <- PercentageFeatureSet(young, pattern = "^MT-")
+young <- subset(young, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+young <- NormalizeData(young, verbose = FALSE)
+
+sci.combined <- merge(aged, y = young, add.cell.ids = c("aged", "young"))
+sci.combined <- NormalizeData(sci.combined)
+sci.combined <- FindVariableFeatures(sci.combined)
+sci.combined <- ScaleData(sci.combined)
+sci.combined <- RunPCA(sci.combined)
+
+
+
+sci.combined <- IntegrateLayers(
+  object = sci.combined, 
+  method = CCAIntegration,     # 对应传统的锚点法
+  orig.reduction = "pca", 
+  new.reduction = "integrated.cca",
+  verbose = FALSE
+)
+
+# 合并图层
+sci.combined <- JoinLayers(sci.combined)
+
+# 使用整合后的降维结果 (integrated.cca) 运行 UMAP
+sci.combined <- RunUMAP(sci.combined, reduction = "integrated.cca", dims = 1:20)
+sci.combined <- FindNeighbors(sci.combined, reduction = "integrated.cca", dims = 1:20)
+sci.combined <- FindClusters(sci.combined, resolution = 0.05)
+
+
+
+#Perform an integrated analysis
+
+DimPlot(sci.combined, reduction = "umap", split.by = "stim")
+saveRDS(sci.combined,file="umap.rds")
+
+#不同组别的基因
+BiocManager::install('multtest')
+install.packages('metap')
+library("multtest")
+library("metap")
+library("devtools")
+install.packages("openxlsx")
+library(openxlsx)
+library(readxl)
+library(devtools)
+devtools::install_github('immunogenomics/presto')
+install.packages("rlang")
+packageVersion("rlang")
+sci.combined <- readRDS("umap.rds")
+output_file <- "conservedgenes.xlsx"
+wb <- createWorkbook()
+
+for (i in 0:7) {
+  
+  # 找保守基因
+  markers <- FindConservedMarkers(
+    object = sci.combined,
+    ident.1 = i,
+    grouping.var = "stim", # 替换成你数据里的样本ID列名
+    verbose = FALSE
+  )
+  
+  # 把行名（基因名）提取成一列
+  markers <- markers %>% 
+    rownames_to_column(var = "gene")
+  
+  # 查看列名
+  # print(colnames(markers))
+  
+  # 自动匹配 log fold change 列
+  logfc_col <- colnames(markers)[grepl("avg_log2FC|log2FC|avg_logFC", colnames(markers))]
+  if(length(logfc_col) == 0){
+    stop("没有找到 log fold change 列，请检查 Seurat 版本和返回列名")
+  }
+  
+  # 按 logFC 排序并提取前10
+  top10_genes <- markers %>%
+    arrange(desc(!!sym(logfc_col[1]))) %>%
+    head(10)
+  
+  # 自动选择 p 值列（如果存在）
+  pval_col <- colnames(markers)[grepl("p_val", colnames(markers))]
+  save_cols <- c("gene", logfc_col[1], pval_col)
+  save_cols <- save_cols[save_cols %in% colnames(top10_genes)]
+  top10_genes <- top10_genes[, save_cols]
+  
+  # 保存到 Excel sheet
+  addWorksheet(wb, paste0("cluster ", i))
+  writeData(wb, sheet = paste0("cluster ", i), top10_genes)
+}
+
+# 保存 Excel 文件
+saveWorkbook(wb, output_file, overwrite = TRUE)
+cat("已保存 cluster 0-6 前10个保守基因到:", output_file, "\n")
+
+# 1. 提取细胞计数表
+cell_counts <- as.data.frame(table(sci.combined$seurat_clusters, sci.combined$stim))
+colnames(cell_counts) <- c("Cluster", "stim", "Count")
+
+# 2. 按组别计算百分比 (Proportion)
+cell_counts <- cell_counts %>%
+  group_by(stim) %>%
+  mutate(Proportion = Count*100/ sum(Count)) %>%
+  ungroup()
+
+ggplot(cell_counts, aes(x = Cluster, y = Proportion, fill = stim)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.7) +
+  theme_minimal() +
+  scale_fill_manual(values = c("young" = "#4575b4", "aged" = "#d73027")) +
+  labs(title = "Comparison of Cluster Proportions",
+       x = "Cell Cluster",
+       y = "Proportion") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+# 一次性计算所有 Cluster 的组间差异 (MMS vs Sham)
+all_groups_degs <- lapply(unique(sci.combined$seurat_clusters), function(x) {
+  print(paste("Processing Cluster", x))
+  FindMarkers(sci.combined, ident.1 = "young", ident.2 = "aged", 
+              group.by = "stim", subset.ident = x, min.pct = 0.1)
+})
+
+# 给列表命名方便查看
+names(all_groups_degs) <- paste0("Cluster", unique(sci.combined$seurat_clusters))
+
+# 保存其中某个群的结果，例如 Cluster 5
+write.csv(all_groups_degs$Cluster7, "immuno_DEGs_cluster7.csv")
+
+
+
+# 1. 合并所有数据
+# 假设您的数据存储在一个名为 all_groups_degs 的列表中
+all_combined_degs <- bind_rows(lapply(names(all_groups_degs), function(name) {
+  df <- all_groups_degs[[name]]
+  df$gene <- rownames(df)
+  df$cluster <- name
+  return(df)
+}))
+
+# 2. 定义显著性状态与过滤
+all_combined_degs <- all_combined_degs %>%
+  mutate(
+    status = case_when(
+      p_val_adj < 0.05 & avg_log2FC > 0.5 ~ "Up",
+      p_val_adj < 0.05 & avg_log2FC < -0.5 ~ "Down",
+      TRUE ~ "Stable"
+    )
+  )
+
+# 3. 提取每个 Cluster 的 Top 20 差异基因用于标注
+# 我们按 abs(avg_log2FC) 排序，确保选出的是两端差异最明显的
+top20_to_label <- all_combined_degs %>%
+  filter(status != "Stable") %>%
+  group_by(cluster) %>%
+  slice_max(order_by = abs(avg_log2FC), n = 20) %>%
+  ungroup() %>%
+  distinct(gene, .keep_all = TRUE) # 去重，防止同一个基因标注多次
+install.packages("ggrepel")
+library("ggrepel")
+# 4. 绘制合并火山图
+ggplot(all_combined_degs, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  # 绘制背景：不显著的点（浅灰色）
+  geom_point(data = filter(all_combined_degs, status== "Stable"), 
+             color = "grey90", alpha = 0.2, size = 0.5) +
+  
+  # 绘制显著点：按 Log2FC 映射颜色渐变
+  # 使用 aes(color = avg_log2FC)
+  geom_point(data = filter(all_combined_degs, status!= "Stable"), 
+             aes(color = avg_log2FC), alpha = 0.6, size = 1.2) +
+  
+  # 设置颜色梯度：深蓝(下调) -> 灰 -> 深红(上调)
+  scale_color_gradient2(low = "#2166AC", mid = "#D1D1D1", high = "#B2182B", 
+                        midpoint = 0, name = "Log2 Fold Change") +
+  
+  # 标注每个群的 Top 20 基因
+  # 使用 color = "black" 确保文字清晰，或者不设置颜色随点走
+  geom_text_repel(data = top20_to_label, aes(label = gene), 
+                  size = 2.5, 
+                  max.overlaps = 50, # 允许较多重叠以显示更多基因
+                  segment.color = "grey50", 
+                  segment.size = 0.2,
+                  force = 2) +
+  
+  # 辅助线
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dotted", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted", color = "black") +
+  
+  # 图表修饰
+  theme_classic() +
+  labs(title = "Combined Volcano Plot: All Clusters (cia vs Sham)",
+       subtitle = "Labeled: Top 20 DEGs per cluster",
+       x = "Log2 Fold Change (cia / Sham)",
+       y = "-log10(Adjusted P-value)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+
+
+# 确保基因名没有重复
+genes_to_plot <- unique(genes_to_plot)
+sci.combined <- ScaleData(sci.combined, features = genes_to_plot)
+# 绘制热图
+# 1. 设置 Excel 文件路径
+file_path <- "E:\\RESEARCH\\meniscus\\GSE286034_RAW\\result\\conservedgenes.xlsx" # 请修改为实际的文件名
+sheet_names <- excel_sheets(file_path)
+
+# 2. 循环读取每个 Sheet 中的基因
+genes_to_plot <- list()
+for (sheet in sheet_names) {
+  # 读取当前 Sheet
+  temp_df <- read_excel(path = file_path, sheet = sheet)
+  # 提取 gene 列，并去掉重复值或空值
+  current_genes <- temp_df %>% pull(gene) %>% unique() %>% na.omit()
+  # 存入列表，以 Sheet 名（细胞群名）命名
+  genes_to_plot[[sheet]] <- as.character(current_genes)
+}
+
+# 3. 将所有基因合并为一个向量（用于热图绘制）
+all_genes <- unlist(genes_to_plot) %>% unique()
+
+p <- DoHeatmap(sci.combined, 
+               features = all_genes, 
+               group.by = "ident",  # 或者你的元数据列名
+               label = TRUE,        # 显示上方群组标签
+               size = 3) +          # 标签字体大小
+  scale_fill_gradientn(colors = c("blue", "white", "red")) # 设置配色
+
+print(p)
+
+
+# 批量生成小提琴图并存储在列表中
+sci.combined <- readRDS("beforenaming.rds")
+features_to_plot <- c("LYZ", "RETN", "CD14", "FCN1", "S100A9", "CST3", "FOS", "VCAN")
+features_to_plot <- c("JCHAIN", "MZB1", "TNFRSF17", "DERL3", "IGHG1", "TGKC")
+features_to_plot <- c("TNFAIP3")
+plot_list <- VlnPlot(sci.combined, 
+                     features = features_to_plot, 
+                     split.by = "stim", 
+                     pt.size = 0, 
+                     combine = FALSE, # 返回列表而不是直接合并
+                     cols = c("#4575b4", "#d73027"))
+
+# 对列表中的每个图进行微调（去掉冗余的 X 轴标题，缩小字体）
+for(i in 1:length(plot_list)) {
+  plot_list[[i]] <- plot_list[[i]] + 
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(size = 8),
+          legend.position = "none") # 先隐藏图例，最后统一放一个
+}
+
+# 使用 wrap_plots 合并，并添加总图例
+wrap_plots(plot_list, ncol = 4) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+
+
+#修改名称1
+new.cluster.ids <- c( "microglia", "macrophage", "endothelial","astrocyte","neutrophil","dentritic cell","fibroblast", "oligodendrocyte","mural cell","fibroblast","T cell")
+names(new.cluster.ids)
+levels(scRNAsub)
+names(new.cluster.ids) <- levels(scRNAsub)
+names(new.cluster.ids)
+new.cluster.ids
+scRNAsub <- RenameIdents(scRNAsub, new.cluster.ids)
+
+DimPlot(scRNAsub, reduction = "umap", split.by = "stim")
+
+
+################################################GO富集#############################################################
+
+library("clusterProfiler")
+library("enrichplot")
+library("colorspace")
+library("ggforce")
+library("DBI")
+library("monocle")
+library("org.Mm.eg.db")
+library(BiocManager)
+BiocManager::install("org.Hs.eg.db")
+
+# --- 1. 设置参数 ---
+
+excel_file <- "immuno_degs.xlsx" # 您的 Excel 文件名
+sheets <- excel_sheets(excel_file)    # 获取所有 Sheet 名称
+output_dir <- "./GO_Results/"         # 结果输出目录
+if(!dir.exists(output_dir)) dir.create(output_dir)
+
+# --- 2. 循环处理每个细胞群 ---
+for (sheet_name in sheets) {
+  message(paste("正在处理细胞群:", sheet_name))
+  
+  # 读取数据
+  deg_data <- read_excel(excel_file, sheet = sheet_name)
+  
+  # 假设第一列是基因名，如果没有列名请手动重命名
+  # 如果第一列已经是基因名，请确保列名为 'gene'
+  colnames(deg_data)[1] <- "gene"
+  
+  # --- 3. 筛选差异基因 ---
+  # 筛选标准：p_val_adj < 0.05 且 |avg_log2FC| > 0.5 (可根据需要调整)
+  up_genes <- deg_data %>% 
+    filter(p_val_adj < 0.05 & avg_log2FC > 0.5) %>% 
+    pull(gene)
+  
+  down_genes <- deg_data %>% 
+    filter(p_val_adj < 0.05 & avg_log2FC < -0.5) %>% 
+    pull(gene)
+  
+  # 定义一个富集分析函数
+  run_go <- function(genes, type, cluster) {
+    # 1. 执行富集分析
+    go_res <- enrichGO(gene          = genes,
+                       OrgDb         = org.Mm.eg.db,
+                       keyType       = "SYMBOL",
+                       ont           = "ALL",
+                       pAdjustMethod = "BH",
+                       pvalueCutoff  = 0.05,
+                       qvalueCutoff  = 0.2)
+    
+    # 2. 执行保存和绘图逻辑 (必须在 return 之前)
+    if (!is.null(go_res) && nrow(as.data.frame(go_res)) > 0) {
+      message(paste("Processing", cluster, type, "..."))
+      
+      # 保存表格
+      write.csv(as.data.frame(go_res), 
+                file = paste0(output_dir, cluster, "_", type, "_GO_table.csv"))
+      
+      # 绘制并保存气泡图
+      p <- dotplot(go_res, showCategory = 15) + 
+        ggtitle(paste(cluster, type, "GO Enrichment"))
+      
+      ggsave(filename = paste0(output_dir, cluster, "_", type, "_GO_dotplot.pdf"), 
+             plot = p, width = 8, height = 7)
+    } else {
+      message(paste("No significant GO terms for", cluster, type))
+    }
+    
+    # 3. 最后再返回结果
+    return(go_res)
+  
+  }
+  
+  # 执行上调和下调基因的 GO 分析
+  run_go(up_genes, "Up", sheet_name)
+  run_go(down_genes, "Down", sheet_name)
+}
+
+ message("所有细胞群 GO 分析已完成！结果保存在 GO_Results 文件夹中。")
+
+library(stringr)
+
+
+
+#=========================================================hdwgcna===========================================
+
+packageVersion("rlang")
+options(repos = c(CRAN = "https://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
+install.packages("rlang")
+options(download.file.method = "libcurl")
+options(url.method = "libcurl")
+devtools::install_github('smorabit/hdWGCNA')
+install.packages("D:/下载/rlang_1.1.7.zip", repos = NULL, type = "win.binary")
+devtools::install_local("D:/下载/hdWGCNA-dev.zip")
+remotes::install_github("UCell")
+setwd("E:\\RESEARCH\\cartilage-mms")
+sci.combined <- readRDS("umap.rds")
+# 初始化
+library(hdWGCNA)
+library(WGCNA)
+library(Seurat)
+library(tidyverse)
+library("BiocManager")
+install.packages("BiocManager")
+BiocManager::install("vctrs")
+library(Seurat)
+library(tidyverse)
+library(hdWGCNA)
+library(WGCNA)
+
+# 1. 读取数据 (10X 格式)
+y14_data <- Read10X(data.dir = "E:\\RESEARCH\\osteosarcoma\\GSE216280_RAW\\14")
+y45_data <- Read10X(data.dir = "E:\\RESEARCH\\osteosarcoma\\GSE216280_RAW\\45")
+
+# 2. 创建 Seurat 对象并添加组别标签
+y14_obj <- CreateSeuratObject(counts = y14_data, project = "y14", min.cells = 3, min.features = 200)
+y14_obj$condition <- "y14"
+
+y45_obj <- CreateSeuratObject(counts = y45_data, project = "y45", min.cells = 3, min.features = 200)
+y45_obj$condition <- "y45"
+
+# 3. 合并数据
+sci.combined <- merge(y14_obj, y = y45_obj, add.cell.ids = c("y14", "y45"))
+
+# 1. 质量控制 (以线粒体基因为例)
+sci.combined[["percent.mt"]] <- PercentageFeatureSet(sci.combined, pattern = "^mt-")
+sci.combined <- subset(sci.combined, subset = nFeature_RNA > 500 & nFeature_RNA < 5000 & percent.mt < 10)
+
+# 2. 标准化与高变基因选取
+sci.combined <- NormalizeData(sci.combined)
+sci.combined <- FindVariableFeatures(sci.combined)
+sci.combined <- ScaleData(sci.combined)
+
+# 3. 降维与聚类
+sci.combined <- RunPCA(sci.combined)
+sci.combined <- FindNeighbors(sci.combined, dims = 1:20)
+sci.combined <- FindClusters(sci.combined, resolution = 0.05)
+sci.combined <- RunUMAP(sci.combined, dims = 1:20)
+
+# 4. 合并图层 (Seurat v5 必须执行这一步，确保 counts 层不为空)
+sci.combined <- JoinLayers(sci.combined)
+
+sci.combined <- SetupForWGCNA(
+  sci.combined,
+  gene_select = "variable", # 使用高变基因，或者 "fraction" (在一定比例细胞中表达)
+  wgcna_name = "meniscus_Project" # 给你的分析起个名
+)
+
+
+# 这里的 k 是聚合细胞的数量，通常设为 20-50
+# group.by 通常选你的分群信息 'seurat_clusters'
+sci.combined <- MetacellsByGroups(
+  seurat_obj = sci.combined,
+  group.by = c("seurat_clusters", "stim"), # 同时考虑分群和组别
+  k = 25, 
+  max_shared = 10,
+  ident = "seurat_clusters"
+)
+
+# 提取 Metacell 表达矩阵
+sci.combined <- NormalizeMetacells(sci.combined)
+# 1. 挑选基因（可以针对特定细胞群，比如你关心的 Cluster 1, 3, 5）
+sci.combined <- SetDatExpr(
+  sci.combined,
+  group_name = "4", # 你可以只跑你感兴趣的群，也可以跑全部
+  use_metacells = TRUE,
+  assay = 'RNA',
+  slot = 'data'
+)
+
+# 2. 挑选软阈值 (Soft Power)
+sci.combined <- TestSoftPowers(sci.combined, networkType = 'signed') 
+
+# 3. 构建网络
+sci.combined <- ConstructNetwork(
+  sci.combined,
+  soft_power = 9, # 根据上一步 TestSoftPowers 的结果来定，通常在 8-16 之间
+  setDatExpr = FALSE,
+  tom_name = 'meniscus_Joint' # 存储拓扑重叠矩阵的名字
+)
+# 计算模块特征向量 (ME)
+sci.combined <- ModuleEigengenes(sci.combined)
+
+# 计算每个基因与模块的连接度 (kME)
+sci.combined <- ModuleConnectivity(sci.combined)
+
+# 获取模块基因列表
+modules <- GetModules(sci.combined)
+head(modules) # 可以看到每个基因属于哪个颜色模块
+hub_genes <- GetHubGenes(sci.combined, n_hubs = 10)
+# 这会返回一个包含每个模块 Top 10 核心基因的表格
+# 假设你的 hub_genes 已经是一个数据框
+node_df <- hub_genes
+
+# 为了美化，我们可以根据模块名称添加对应的颜色列
+# 这样导入 Cytoscape 后可以直接填充节点颜色
+node_df$color <- node_df$module 
+
+# 导出节点文件
+write.csv(node_df, "Cytoscape_Nodes_HubGenes-cluster4.csv", row.names = FALSE)
+# 1. 提取所有基因之间的连接权重 (TOM)
+# 确保你之前运行过 ConstructNetwork
+TOM <- GetTOM(sci.combined) 
+
+# 2. 筛选你关注的 Hub 基因
+# 建议只选每个模块前 25-50 个基因，否则连线太多 Cytoscape 会卡死
+target_genes <- hub_genes$gene_name
+# 确保这些基因在矩阵中存在
+target_genes <- intersect(target_genes, colnames(TOM))
+
+# 3. 提取子矩阵并转换为边列表
+sub_TOM <- TOM[target_genes, target_genes]
+
+# 将矩阵转为长表格格式 (Source, Target, Weight)
+edge_df <- as.data.frame(as.table(sub_TOM))
+colnames(edge_df) <- c("from", "to", "weight")
+
+# 4. 关键：过滤掉弱连接（非常重要，否则图会变成一团乱麻）
+# 通常设置权重阈值在 0.1 到 0.2 之间
+edge_df <- edge_df[edge_df$weight > 0.15 & edge_df$from != edge_df$to, ]
+
+# 导出边文件
+write.csv(edge_df, "Cytoscape_Edges_HubGenes-cluster4.csv", row.names = FALSE)
+getwd()
+#================================================================================
+
+#+++++++++++++++++++++++++++++++++++++++++++++++++++++++++monocle3++++++++++++++++++++++++++++++++++++++++=
+library(Seurat)
+library(monocle3)
+library(SeuratWrappers)# 用于 Seurat 与 Monocle3 转换
+library(BiocManager)
+library(devtools)
+BiocManager::install("cole-trapnell-lab/monocle3")
+devtools::install_github("cole-trapnell-lab/monocle3")
+BiocManager::install('satijalab/seurat-wrappers')
+devtools::install_github('satijalab/seurat-wrappers')
+# 设置下载方式，增加超时时间
+options(timeout = 600) 
+
+# 使用 fastgh 镜像进行安装
+remotes::install_github('satijalab/seurat-wrappers', 
+                        hostname = "hub.fastgit.xyz") # 或者使用其他可用的镜像
+# 1. 将 Seurat 对象转换为 Monocle3 的 cds 对象
+cds <- as.cell_data_set(sci.combined)  # timeline 是你的 Seurat 对象名
+
+# 2. 计算 UMAP 和聚类（如果 Seurat 中已有，可以复用）
+# Monocle3 默认会使用已有的降维结果，如果没有则重新计算
+cds <- preprocess_cds(cds, num_dim = 50)  # 使用 PCA 的前50个维度
+cds <- reduce_dimension(cds, preprocess_method = "PCA")
+
+# 3. 使用 Seurat 中的聚类标签（避免重新聚类）
+colData(cds)$seurat_clusters <- Idents(sci.combined)
+cds <- cluster_cells(cds, resolution = 1e-5)  # resolution 设很小，强制使用已有聚类
+
+# 或者直接手动指定聚类
+# cds@clusters$UMAP$clusters <- as.character(Idents(timeline))
+
+# 4. 学习轨迹图（核心步骤）
+cds <- learn_graph(cds, use_partition = FALSE)  # use_partition=FALSE 使用全部细胞
+
+# 5. 确定拟时起点（手动选择或根据基因表达自动判断）
+# 方法A：手动选择（推荐，可视化后交互选择）
+plot_cells(cds, color_cells_by = "seurat_clusters", label_groups_by_cluster = FALSE, 
+           label_leaves = FALSE, label_branch_points = FALSE)
+# 运行后点击图形界面中的细胞群作为起点，然后按 "Done"
+cds <- order_cells(cds)
+
+# 方法B：根据特定基因表达自动选择（例如 T 细胞标记 CD3D 作为起点）
+# 先找出表达特定基因的细胞作为根
+root_cells <- which(pData(cds)$seurat_clusters == "0")  # 假设 cluster1 是 T 细胞
+cds <- order_cells(cds, root_cells = root_cells)
+
+# 6. 可视化拟时轨迹
+plot_cells(cds, color_cells_by = "pseudotime", label_cell_groups = FALSE, 
+           label_leaves = FALSE, label_branch_points = FALSE, 
+           graph_label_size = 2) + 
+  scale_color_viridis_c()
+
+# 7. 查看拟时值并添加到 Seurat 对象
+sci.combined$pseudotime <- pseudotime(cds)
+
+# 8. 可视化拟时值在原始 UMAP 上的分布
+DimPlot(sci.combined, group.by = "pseudotime", reduction = "umap", 
+        cols = viridis::viridis(100)) + 
+  scale_color_viridis_c()
+FeaturePlot(sci.combined, 
+            features = "pseudotime", 
+            reduction = "umap") + 
+  scale_color_viridis_c(option = "plasma") # 或者使用 "viridis"
+# 9. 分析随拟时变化的基因（动态表达）
+# 找到随拟时显著变化的基因
+pr_test_res <- graph_test(cds, neighbor_graph = "principal_graph", cores = 4)
+pr_test_res <- pr_test_res[order(pr_test_res$morans_I, decreasing = TRUE), ]
+head(pr_test_res, 20)
+saveRDS(sci.combined,"pseudotime.rds")
+# 可视化特定基因的表达随拟时的变化
+rowData(cds)$gene_short_name <- rownames(cds)
+plot_genes_in_pseudotime(cds[c("TNFRSF17", "BIRC5", "UBE2C"), ], 
+                         color_cells_by = "seurat_clusters", 
+                         min_expr = 0.5)
+#==========================================================cellchat=============================================
+library(CellChat)
+library(seurat)
+library(ggplot2)
+library(tidyverse)
+library(dplyr)
+library(NMF)
+library(ggalluvial)
+library(patchwork)
+library(svglite)
+options(stringsAsFactors = FALSE)
+
+setwd("E:\\RESEARCH\\osteosarcoma\\GSE216280_RAW\\result")
+sci.combined <- readRDS("sub_immuno.rds")
+sci.combined@commands$FindClusters
+y14_obj <- subset(sci.combined, subset = condition == "y14")
+y45_obj <- subset(sci.combined, subset = condition == "y45")
+# 1. 切换回 RNA assay
+DefaultAssay(sci.combined) <- "RNA"
+
+# 2. 合并可能存在的碎片化图层 (data.1, data.2 ...)
+cia_obj <- JoinLayers(y14_obj)
+# 3. 提取标准化后的数据矩阵
+# 在 Seurat v5 中，这是最稳妥的提取方式
+data.input <- GetAssayData(sci.combined, assay = "RNA", layer = "data") 
+
+# 4. 提取元数据
+meta <- sci.combined@meta.data
+# 1. 在元数据中创建一个新的列，把数字编号变成字符
+# 假设你的分群列是 seurat_clusters
+meta$cell_type <- paste0("Cluster", meta$seurat_clusters)
+
+# 2. 检查一下是否转换成功（确保没有纯 0 了）
+table(meta$cell_type)
+
+# 3. 重新创建 CellChat 对象，这次 group.by 指向新列 "cell_type"
+cellchat <- createCellChat(object = data.input, 
+                           meta = meta, 
+                           group.by = "cell_type")
+
+# 设置数据库
+cellchatDB <- CellChatDB.mouse 
+cellchat@DB <- cellchatDB
+cellchat <- subsetData(cellchat)
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+
+str(cellchat@data.signaling)
+# 计算通讯
+cellchat <- computeCommunProb(cellchat, type = "triMean")
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+
+
+
+# 2. 差异网络图 (Diff Heatmap/Circle)
+# 红色线代表 MMS 增强的通讯，蓝色线代表减弱的通讯
+par(mfrow = c(1,2))
+for (i in 1:length(cellchat@net)) {
+  cellchat@net[[i]][is.na(cellchat@net[[i]])] <- 0
+}
+
+gg1 <- netVisual_heatmap(cellchat, measure = "count", title.name = "Differential interactions (Count)")
+gg2 <- netVisual_heatmap(cellchat, measure = "weight", title.name = "Differential interactions (Weight)")
+gg1+gg2
+#计算细胞数量
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, 
+                 label.edge= F, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = T, 
+                 label.edge= F, title.name = "Interaction weights/strength")
+
+
+
+p = plotGeneExpression(cellchat, signaling = "CSF")
+p
+ggsave("TGFb_GeneExpression_vln.pdf", p, width = 8, height = 8)
+#计算贡献值
+pathway.show<-head(cellchat@netP$pathways,n=1)
+netAnalysis_contribution(cellchat, signaling = pathway.show)
+
+library(BiocManager)
+
+library("ggsankeyfier")
+library(ggsankey)
+library(ggplot2)
+library(dplyr)
+devtools::install_github("davidsjoberg/ggsankey")
+
+# 1. 从合并后的 CellChat 对象提取所有显著的通讯关系
+# 我们取 MMS 组的通讯，因为那是退变发生的地方
+df.net <- subsetCommunication(cellchat) 
+
+# 2. 读取你上传的 Hub 基因数据
+hub_data <- read.csv("Cytoscape_Nodes_HubGenes.csv")
+my_hubs <- hub_data$gene_name
+
+# 3. 筛选数据：只保留涉及 Hub 基因的通讯流
+river_df <- df.net %>%
+  # 检查配体或受体是否在你的 Hub 基因列表里
+  filter(ligand %in% my_hubs | receptor %in% my_hubs) %>%
+  mutate(TargetHub = ifelse(ligand %in% my_hubs, ligand, receptor)) %>%
+  # 选择三列：来源细胞、信号通路、目标Hub基因
+  select(source, pathway_name, TargetHub) %>%
+  distinct() %>%
+  # 为了防止图太乱，只取前 20 条最强的通路或连接
+  head(25) 
+
+# 4. 转换格式
+df_long <- river_df %>% make_long(source, pathway_name, TargetHub)
+
+# 5. 绘图
+# 定义莫兰迪色表
+install.packages("MetBrewer")
+library(MetBrewer)
+
+ggplot(df_long, aes(x = x, next_x = next_x, node = node, next_node = next_node, 
+                    fill = factor(node), label = node)) +
+  geom_sankey(flow.alpha = 0.7, node.color = "gray90", width = 0.15) +
+  geom_sankey_label(size = 3, color = "#333333") +
+  # 使用经典的 "Hiroshige" 艺术配色，非常适合展示流向
+  scale_fill_manual(values = met.brewer("Hiroshige", length(unique(df_long$node)))) +
+  theme_sankey() +
+  theme(legend.position = "none")
+
+ggplot(df_long, aes(x = x, next_x = next_x, node = node, next_node = next_node, 
+                    fill = factor(node), label = node)) +
+  geom_sankey(flow.alpha = 0.6, node.color = "gray40") +
+  geom_sankey_label(size = 3, color = "white", fill = "gray20") +
+  theme_sankey(base_size = 16) +
+  scale_fill_viridis_d() +
+  labs(title = "MMS Model: Cell-Pathway-HubGene Flow", x = "") +
+  theme(legend.position = "none")
+#==================================================================cluster 4 wgcna========================================
+library(readxl)
+library(WGCNA)
+library(dplyr)
+
+# 1. 加载数据
+file_path <- "E:/RESEARCH/meniscus/GSE286034_RAW/result/immuno_degs.xlsx"
+# 读取 cluster4 所在的 Sheet
+df_raw <- read_excel(file_path, sheet = "cluster4")
+
+# 2. 筛选 p_val_adj 最小的前 20 个基因
+# 假设列名是 p_val_adj，如果您的表格列名不同，请修改此处
+df_top20 <- df_raw %>%
+  arrange(p_val_adj) %>%      # 按 P 值从小到大排序
+  head(20)                    # 取前 20 行
+
+# 提取基因名称（假设第一列是基因名）
+target_genes <- df_top20[[1]]
+cat("选定的前20个显著基因是：\n", paste(target_genes, collapse = ", "), "\n")
+
+# 3. 准备表达量矩阵
+# 注意：hdWGCNA 需要这些基因在各个样本中的表达值
+# 假设从第 2 列开始到最后一列是样本的表达量数据
+datExpr <- as.data.frame(t(df_top20[, -1])) 
+# 如果您的表格后面带有 logFC, p_val 等统计列，请确保 -1 修改为排除这些非表达量列的范围
+# 例如：df_top20[, 2:21] 表示第2到21列是样本数据
+
+colnames(datExpr) <- target_genes
+rownames(datExpr) <- colnames(df_top20)[-1]
+
+# 4. 计算邻接矩阵 (由于基因极少，这里 softPower 选 1 即可，或沿用常用值)
+# 对于极少量基因，我们主要看它们的相关性强度
+adjacency = adjacency(datExpr, power = 1, type = "unsigned")
+TOM = TOMsimilarity(adjacency)
+
+# 5. 导出 Cytoscape 文件
+# 因为只有20个基因，threshold 可以设低一点（比如 0），展示所有可能的连接
+exportNetworkToCytoscape(
+  TOM,
+  edgeFile = "cluster4_top20_edges.csv",
+  nodeFile = "cluster4_top20_nodes.csv",
+  weighted = TRUE,
+  threshold = 0, 
+  nodeNames = target_genes,
+  altNodeNames = target_genes
+)
+
+cat("\n文件已生成！请查看工作目录下的 cluster4_top20_edges.csv")
